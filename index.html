@@ -43,9 +43,8 @@
     }
   </style>
 
-  <!-- WebLLM loader with CDN fallback -->
+  <!-- Resilient WebLLM loader with multi CDN and ESM fallback -->
   <script>
-    // Load WebLLM from multiple CDNs. First one that works wins.
     async function loadScript(src){
       return new Promise((resolve, reject)=>{
         const s = document.createElement('script');
@@ -56,17 +55,56 @@
         document.head.appendChild(s);
       });
     }
+
+    async function tryDynamicImport(url){
+      try{
+        const mod = await import(url);
+        if (mod && (mod.webllm || mod.CreateMLCEngine)){
+          // Normalize to window.webllm for the rest of the app
+          window.webllm = window.webllm || {};
+          if (mod.webllm) Object.assign(window.webllm, mod.webllm);
+          if (mod.CreateMLCEngine) window.webllm.CreateMLCEngine = mod.CreateMLCEngine;
+          return true;
+        }
+      }catch(e){}
+      return false;
+    }
+
     async function loadWebLLMLibrary(){
-      if (window.webllm) return;
-      const cdns = [
+      if (window.webllm && window.webllm.CreateMLCEngine) return;
+
+      // Known UMD bundle names across versions
+      const UMD = [
+        "https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm@0.2.48/dist/index.min.js",
         "https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm@0.2.48/dist/web-llm.min.js",
-        "https://unpkg.com/@mlc-ai/web-llm@0.2.48/dist/web-llm.min.js"
+        "https://unpkg.com/@mlc-ai/web-llm@0.2.48/dist/index.min.js",
+        "https://unpkg.com/@mlc-ai/web-llm@0.2.48/dist/web-llm.min.js",
+        // Older stable fallbacks
+        "https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm@0.2.46/dist/index.min.js",
+        "https://unpkg.com/@mlc-ai/web-llm@0.2.46/dist/index.min.js"
       ];
-      let lastErr = null;
-      for (const url of cdns){
-        try { await loadScript(url); if (window.webllm) return; } catch(e){ lastErr = e; }
+
+      // Try UMD first
+      for (const url of UMD){
+        try{
+          await loadScript(url);
+          if (window.webllm && window.webllm.CreateMLCEngine) return;
+        }catch(e){}
       }
-      throw lastErr || new Error("WebLLM library failed to load");
+
+      // ESM fallbacks that we convert into window.webllm
+      const ESM = [
+        "https://esm.run/@mlc-ai/web-llm@0.2.48",
+        "https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm@0.2.48/+esm",
+        "https://esm.run/@mlc-ai/web-llm@0.2.46",
+        "https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm@0.2.46/+esm"
+      ];
+      for (const url of ESM){
+        const ok = await tryDynamicImport(url);
+        if (ok && window.webllm && window.webllm.CreateMLCEngine) return;
+      }
+
+      throw new Error("WebLLM library failed to load from all sources");
     }
   </script>
 </head>
@@ -102,7 +140,7 @@
         <label>WebLLM model</label>
         <select id="webllm-model">
           <option value="Llama-3.2-1B-Instruct-q4f16_1">Llama 3.2 1B Instruct q4f16_1</option>
-          <option value="Phi-3-mini-4k-instruct-q4f16_1">Phi-3 mini 4k instruct q4f16_1</option>
+          <option value="Phi-3-mini-4k-instruct-q4f16_1">Phi 3 mini 4k instruct q4f16_1</option>
           <option value="Qwen2.5-1.5B-Instruct-q4f16_1">Qwen2.5 1.5B Instruct q4f16_1</option>
         </select>
         <div class="sys" id="webllm-status">Status: idle</div>
@@ -269,15 +307,20 @@
       throw new Error("WebGPU not available");
     }
 
-    // Load library if needed
-    if (!window.webllm){
+    // Load library if needed with resilient strategy
+    if (!window.webllm || !window.webllm.CreateMLCEngine){
       els.status.textContent = "Loading WebLLM library...";
-      await loadWebLLMLibrary();
+      try{
+        await loadWebLLMLibrary();
+      }catch(e){
+        els.status.textContent = "Failed to load WebLLM library";
+        throw e;
+      }
     }
 
     const model = els.webllmModel.value;
 
-    // If already loaded with same model, reuse
+    // Reuse engine if already loaded for this model
     if (window.webllm && webllmEngine?.getModelId && webllmEngine.getModelId() === model){
       els.status.textContent = "Ready: " + model;
       return;
