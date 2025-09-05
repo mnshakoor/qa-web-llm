@@ -10,18 +10,16 @@
       --bg:#0b0f14; --panel:#121821; --muted:#6b7280; --text:#e5e7eb; --accent:#93c5fd; --accent2:#34d399; --warn:#fbbf24; --error:#f87171; --border:#1f2937;
     }
     *{box-sizing:border-box}
-    body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial}
+    body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
     header{position:sticky;top:0;z-index:10;background:rgba(11,15,20,.9);backdrop-filter:saturate(140%) blur(8px);border-bottom:1px solid var(--border)}
     .wrap{max-width:1100px;margin:0 auto;padding:16px}
     .row{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end}
     .card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:12px}
-    select, input[type="text"], input[type="number"], textarea{
+    select,input[type="text"],input[type="number"],textarea{
       width:100%;background:#0f1520;color:var(--text);border:1px solid var(--border);border-radius:10px;padding:10px;outline:none
     }
     label{font-size:.9rem;color:var(--muted);display:block;margin-bottom:6px}
-    button{
-      border:1px solid var(--border);background:#0f1520;color:var(--text);padding:10px 14px;border-radius:10px;cursor:pointer
-    }
+    button{border:1px solid var(--border);background:#0f1520;color:var(--text);padding:10px 14px;border-radius:10px;cursor:pointer}
     button.primary{background:var(--accent);color:#0a0a0a;border-color:transparent}
     button.ghost{background:transparent}
     .chat{display:flex;gap:12px}
@@ -44,8 +42,33 @@
       .sidebar{flex:1 1 auto}
     }
   </style>
-  <!-- WebLLM CDN. Works only when using the WebLLM backend -->
-  <script src="https://unpkg.com/@mlc-ai/web-llm@0.2.48/dist/index.min.js"></script>
+
+  <!-- WebLLM loader with CDN fallback -->
+  <script>
+    // Load WebLLM from multiple CDNs. First one that works wins.
+    async function loadScript(src){
+      return new Promise((resolve, reject)=>{
+        const s = document.createElement('script');
+        s.src = src;
+        s.async = true;
+        s.onload = ()=>resolve(src);
+        s.onerror = ()=>reject(new Error('Failed ' + src));
+        document.head.appendChild(s);
+      });
+    }
+    async function loadWebLLMLibrary(){
+      if (window.webllm) return;
+      const cdns = [
+        "https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm@0.2.48/dist/web-llm.min.js",
+        "https://unpkg.com/@mlc-ai/web-llm@0.2.48/dist/web-llm.min.js"
+      ];
+      let lastErr = null;
+      for (const url of cdns){
+        try { await loadScript(url); if (window.webllm) return; } catch(e){ lastErr = e; }
+      }
+      throw lastErr || new Error("WebLLM library failed to load");
+    }
+  </script>
 </head>
 <body>
 <header>
@@ -69,7 +92,7 @@
       <div>
         <label>Backend</label>
         <select id="backend">
-          <option value="webllm">WebLLM (on device)</option>
+          <option value="webllm">WebLLM - on device</option>
           <option value="hf">Hugging Face via proxy</option>
           <option value="google">Google AI Studio via proxy</option>
         </select>
@@ -137,7 +160,7 @@
 </div>
 
 <script>
-  // Basic config holder
+  // Element refs
   const els = {
     backend: document.getElementById('backend'),
     webllmBlock: document.getElementById('webllm-block'),
@@ -170,11 +193,15 @@
     document.documentElement.style.filter = dark ? '' : 'invert(1) hue-rotate(180deg)';
   };
 
-  // GPU detection
+  // GPU detection with helpful hint
   (async () => {
     try {
       const adapter = await navigator.gpu?.requestAdapter();
       els.gpu.textContent = adapter ? 'WebGPU' : 'CPU';
+      if (!adapter){
+        document.querySelector('#webllm-status').textContent =
+          "WebGPU not detected. Use Chrome or Edge desktop v121+.";
+      }
     } catch { els.gpu.textContent = 'CPU'; }
   })();
 
@@ -191,13 +218,16 @@
 
   // Chat state
   let history = [];
-  const push = (role, content) => {
-    history.push({role, content});
+  function appendMessage(role, content){
     const div = document.createElement('div');
     div.className = 'msg ' + (role === 'user' ? 'user' : 'assistant');
     div.textContent = content;
     els.msgs.appendChild(div);
     els.msgs.scrollTop = els.msgs.scrollHeight;
+  }
+  const push = (role, content) => {
+    history.push({role, content});
+    appendMessage(role, content);
     els.kpiMsgs.textContent = history.filter(m=>m.role!=='system').length;
     localStorage.setItem('llm-anywhere-history', JSON.stringify(history));
   };
@@ -205,7 +235,11 @@
   // Load saved chat
   try {
     const saved = localStorage.getItem('llm-anywhere-history');
-    if(saved){ history = JSON.parse(saved); history.forEach(m=>push(m.role, m.content)); }
+    if(saved){
+      history = JSON.parse(saved);
+      history.forEach(m=>appendMessage(m.role, m.content));
+      els.kpiMsgs.textContent = history.filter(m=>m.role!=='system').length;
+    }
   } catch {}
 
   // Clear and export
@@ -215,7 +249,7 @@
     const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'chat-export.json'; a.click();
   };
 
-  // Simple role templating for single-prompt providers
+  // Prompt templating for single prompt providers
   function toPrompt(system, messages){
     const s = system?.trim() ? `<<SYS>>\n${system.trim()}\n<</SYS>>\n\n` : '';
     const body = messages.map(m => {
@@ -227,20 +261,46 @@
 
   // WebLLM engine holder
   let webllmEngine = null;
+
   async function ensureWebLLM(){
-    const model = els.webllmModel.value;
-    els.status.textContent = 'Loading model ' + model + ' ...';
-    if(webllmEngine && webllmEngine.getModelId && webllmEngine.getModelId() === model){
-      els.status.textContent = 'Ready: ' + model; return;
+    // Early WebGPU check
+    if (!('gpu' in navigator)){
+      els.status.textContent = "WebGPU not available in this browser";
+      throw new Error("WebGPU not available");
     }
+
+    // Load library if needed
+    if (!window.webllm){
+      els.status.textContent = "Loading WebLLM library...";
+      await loadWebLLMLibrary();
+    }
+
+    const model = els.webllmModel.value;
+
+    // If already loaded with same model, reuse
+    if (window.webllm && webllmEngine?.getModelId && webllmEngine.getModelId() === model){
+      els.status.textContent = "Ready: " + model;
+      return;
+    }
+
+    els.status.textContent = "Loading model " + model + " ...";
     webllmEngine = await window.webllm.CreateMLCEngine(model, {
-      initProgressCallback: (p) => { els.status.textContent = `Loading ${Math.round(p.progress*100)}%`; }
+      initProgressCallback: (p) => {
+        const prog = Math.round(((p && p.progress) ? p.progress : 0) * 100);
+        els.status.textContent = `Loading ${prog}%`;
+      }
     });
-    els.status.textContent = 'Ready: ' + model;
+    els.status.textContent = "Ready: " + model;
   }
 
   async function chatWebLLM(){
-    await ensureWebLLM();
+    try{
+      await ensureWebLLM();
+    }catch(e){
+      push('assistant', "WebLLM failed: " + (e?.message || e));
+      return;
+    }
+
     const messages = [];
     const sys = els.system.value.trim();
     if(sys) messages.push({role:'system', content: sys});
@@ -253,7 +313,6 @@
       stream: true
     };
 
-    // Streaming
     const placeholder = document.createElement('div');
     placeholder.className = 'msg assistant';
     placeholder.textContent = '';
@@ -264,7 +323,11 @@
     const completion = await webllmEngine.chat.completions.create(params);
     for await (const chunk of completion){
       const delta = chunk?.choices?.[0]?.delta?.content || '';
-      if(delta){ full += delta; placeholder.textContent = full; els.msgs.scrollTop = els.msgs.scrollHeight; }
+      if(delta){
+        full += delta;
+        placeholder.textContent = full;
+        els.msgs.scrollTop = els.msgs.scrollHeight;
+      }
     }
     history.push({role:'assistant', content: full});
     localStorage.setItem('llm-anywhere-history', JSON.stringify(history));
